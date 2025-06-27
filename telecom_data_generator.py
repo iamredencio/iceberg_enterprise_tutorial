@@ -9,6 +9,9 @@ across multiple sites, regions, and technologies.
 Usage:
     python telecom_data_generator.py --sites 100 --chunks 50 --output data.csv
     
+    # Save to S3
+    python telecom_data_generator.py --sites 100 --chunks 50 --s3-bucket my-bucket --s3-key data/telecom_data.parquet
+    
 Or import as a module:
     from telecom_data_generator import generate_telecom_data
     data = generate_telecom_data(num_sites=100, num_time_chunks=50)
@@ -20,7 +23,16 @@ import numpy as np
 from datetime import datetime, timedelta
 import random
 import sys
+import os
 from typing import Tuple, List, Dict, Optional
+
+# S3 support (optional import)
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
 
 
 class TelecomDataGenerator:
@@ -49,6 +61,14 @@ class TelecomDataGenerator:
             '7G': {'rssi': -70, 'latency': 8, 'data_volume': 5000},
             '8G': {'rssi': -65, 'latency': 5, 'data_volume': 8000}
         }
+        
+        # Initialize S3 client if available
+        self.s3_client = None
+        if S3_AVAILABLE:
+            try:
+                self.s3_client = boto3.client('s3')
+            except Exception:
+                pass  # S3 client initialization will be handled later if needed
     
     def generate_site_metadata(self, num_sites: int) -> pd.DataFrame:
         """Generate metadata for telecom sites."""
@@ -159,8 +179,119 @@ class TelecomDataGenerator:
         
         return data_df
     
-    def save_data(self, data_df: pd.DataFrame, output_file: str) -> None:
-        """Save generated data to file."""
+    def _setup_s3_client(self, aws_access_key_id: Optional[str] = None,
+                        aws_secret_access_key: Optional[str] = None,
+                        aws_region: str = 'us-east-1') -> bool:
+        """Setup S3 client with credentials."""
+        if not S3_AVAILABLE:
+            print("ERROR: boto3 is not installed. Install with: pip install boto3")
+            return False
+        
+        try:
+            # Use provided credentials or environment variables
+            if aws_access_key_id and aws_secret_access_key:
+                self.s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key,
+                    region_name=aws_region
+                )
+            else:
+                # Use default credential chain (environment variables, IAM roles, etc.)
+                self.s3_client = boto3.client('s3', region_name=aws_region)
+            
+            # Test credentials by listing buckets (or at least attempting to)
+            self.s3_client.list_buckets()
+            return True
+            
+        except NoCredentialsError:
+            print("ERROR: AWS credentials not found. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables or use --aws-access-key and --aws-secret-key options.")
+            return False
+        except ClientError as e:
+            print(f"ERROR: AWS authentication failed: {e}")
+            return False
+        except Exception as e:
+            print(f"ERROR: Failed to setup S3 client: {e}")
+            return False
+    
+    def save_to_s3(self, data_df: pd.DataFrame, bucket: str, key: str,
+                  aws_access_key_id: Optional[str] = None,
+                  aws_secret_access_key: Optional[str] = None,
+                  aws_region: str = 'us-east-1') -> bool:
+        """Save DataFrame to S3."""
+        if not self._setup_s3_client(aws_access_key_id, aws_secret_access_key, aws_region):
+            return False
+        
+        try:
+            # Determine file format from key extension
+            if key.endswith('.parquet'):
+                # Save as parquet (recommended for Iceberg)
+                import io
+                buffer = io.BytesIO()
+                data_df.to_parquet(buffer, index=False)
+                buffer.seek(0)
+                
+                self.s3_client.upload_fileobj(buffer, bucket, key)
+                print(f"Data uploaded to s3://{bucket}/{key} (Parquet format)")
+                
+            elif key.endswith('.csv'):
+                # Save as CSV
+                import io
+                buffer = io.StringIO()
+                data_df.to_csv(buffer, index=False)
+                
+                self.s3_client.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=buffer.getvalue()
+                )
+                print(f"Data uploaded to s3://{bucket}/{key} (CSV format)")
+                
+            else:
+                # Default to parquet
+                import io
+                buffer = io.BytesIO()
+                data_df.to_parquet(buffer, index=False)
+                buffer.seek(0)
+                
+                parquet_key = key + '.parquet' if not key.endswith('.parquet') else key
+                self.s3_client.upload_fileobj(buffer, bucket, parquet_key)
+                print(f"Data uploaded to s3://{bucket}/{parquet_key} (Parquet format)")
+            
+            print(f"Dataset info: {len(data_df):,} rows, {len(data_df.columns)} columns")
+            return True
+            
+        except ClientError as e:
+            print(f"ERROR: Failed to upload to S3: {e}")
+            return False
+        except Exception as e:
+            print(f"ERROR: Unexpected error during S3 upload: {e}")
+            return False
+    
+    def save_data(self, data_df: pd.DataFrame, output_file: str = None,
+                 s3_bucket: str = None, s3_key: str = None,
+                 aws_access_key_id: str = None, aws_secret_access_key: str = None,
+                 aws_region: str = 'us-east-1') -> None:
+        """Save generated data to file or S3."""
+        
+        if s3_bucket and s3_key:
+            # Save to S3
+            success = self.save_to_s3(
+                data_df, s3_bucket, s3_key,
+                aws_access_key_id, aws_secret_access_key, aws_region
+            )
+            if not success:
+                print("S3 upload failed. Falling back to local file save.")
+                if output_file:
+                    self._save_local_file(data_df, output_file)
+        elif output_file:
+            # Save to local file
+            self._save_local_file(data_df, output_file)
+        else:
+            print("ERROR: No output destination specified (local file or S3)")
+    
+    def _save_local_file(self, data_df: pd.DataFrame, output_file: str) -> None:
+        """Save DataFrame to local file."""
         if output_file.endswith('.csv'):
             data_df.to_csv(output_file, index=False)
         elif output_file.endswith('.parquet'):
@@ -222,7 +353,47 @@ def main():
         help='Show data preview instead of saving to file'
     )
     
+    # S3 options
+    parser.add_argument(
+        '--s3-bucket', type=str, default=None,
+        help='S3 bucket name for data upload'
+    )
+    
+    parser.add_argument(
+        '--s3-key', type=str, default=None,
+        help='S3 key (path) for data upload'
+    )
+    
+    parser.add_argument(
+        '--aws-access-key', type=str, default=None,
+        help='AWS access key ID (or use AWS_ACCESS_KEY_ID env var)'
+    )
+    
+    parser.add_argument(
+        '--aws-secret-key', type=str, default=None,
+        help='AWS secret access key (or use AWS_SECRET_ACCESS_KEY env var)'
+    )
+    
+    parser.add_argument(
+        '--aws-region', type=str, default='us-east-1',
+        help='AWS region for S3 operations'
+    )
+    
     args = parser.parse_args()
+    
+    # Check S3 availability if S3 options are provided
+    if (args.s3_bucket or args.s3_key) and not S3_AVAILABLE:
+        print("ERROR: S3 functionality requires boto3. Install with: pip install boto3")
+        sys.exit(1)
+    
+    # Validate S3 options
+    if args.s3_bucket and not args.s3_key:
+        print("ERROR: --s3-key is required when --s3-bucket is specified")
+        sys.exit(1)
+    
+    if args.s3_key and not args.s3_bucket:
+        print("ERROR: --s3-bucket is required when --s3-key is specified")
+        sys.exit(1)
     
     try:
         # Generate data
@@ -237,7 +408,15 @@ def main():
             print(data_df.describe())
         else:
             # Save data
-            generator.save_data(data_df, args.output)
+            generator.save_data(
+                data_df, 
+                output_file=args.output if not (args.s3_bucket and args.s3_key) else None,
+                s3_bucket=args.s3_bucket,
+                s3_key=args.s3_key,
+                aws_access_key_id=args.aws_access_key,
+                aws_secret_access_key=args.aws_secret_key,
+                aws_region=args.aws_region
+            )
             
     except KeyboardInterrupt:
         print("\nData generation interrupted by user")
